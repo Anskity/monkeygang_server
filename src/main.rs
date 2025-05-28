@@ -1,10 +1,17 @@
-use std::{error::Error, ffi::CString, sync::Arc};
+use std::{error::Error, sync::Arc};
 
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
-use tokio_postgres::types::ToSql;
+use monkeygang_server::{
+    STRING_BUFFER_SIZE,
+    database::{self, MODELS, get_record},
+};
+use native_db::{Builder, Database};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 
 struct Server {
-    listener: TcpListener
+    listener: TcpListener,
 }
 
 type ClientPacketType = u8;
@@ -15,14 +22,12 @@ const PACKET_SIZE: usize = size_of::<ClientPacket>();
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct PacketGetInfo {
-    
-}
+struct PacketGetInfo {}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PacketSendRecord {
-    string_buffer: [u8; 128],
+    string_buffer: [u8; STRING_BUFFER_SIZE],
     wave: u32,
     time: u32,
 }
@@ -47,7 +52,7 @@ const SERVER_PACKET_TYPE_RECORDS: ServerPacketType = 0;
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Record {
-    name: [u8; 128],
+    name: [u8; STRING_BUFFER_SIZE],
     wave: u32,
     time: u32,
 }
@@ -66,61 +71,80 @@ struct ServerPacket {
 }
 
 impl Server {
-    pub async fn run(&mut self, postgres: Arc<tokio_postgres::Client>) {
-        let (mut stream, addr) = self.listener.accept().await.expect("Error accepting connection");
+    pub async fn run(&mut self, db: Arc<Database<'_>>) {
+        let (mut stream, addr) = self
+            .listener
+            .accept()
+            .await
+            .expect("Error accepting connection");
 
-        tokio::spawn(async move {
-            let addr = addr.to_string();
-            println!("Starting connection with: {}", addr);
-            
-            let mut bytes: [u8; PACKET_SIZE] = [0; PACKET_SIZE];
-            let n: usize = match stream.read(&mut bytes).await {
-                Ok(n) => n,
-                Err(err) => {
-                    println!("Got an error: {}", err);
-                    return;   
-                }
-            };
+        // tokio::spawn(async move {
+        let addr = addr.to_string();
+        println!("Starting connection with: {}", addr);
 
-            if n == 0 {
-                println!("Got an empty byte stream");
+        let mut bytes: [u8; PACKET_SIZE] = [0; PACKET_SIZE];
+        let n: usize = match stream.read(&mut bytes).await {
+            Ok(n) => n,
+            Err(err) => {
+                println!("Got an error: {}", err);
+                return;
             }
+        };
 
-            let message = unsafe {
-                *(bytes.as_ptr() as *const ClientPacket)
-            };
+        if n == 0 {
+            println!("Got an empty byte stream");
+        }
 
-            match bytes[0] {
-                PACKET_TYPE_GET_INFO => {
-                    Server::handle_get_records(&mut stream, &unsafe{message.data.get_info}, postgres.clone()).await;
-                }
-                PACKET_TYPE_SEND_RECORD => {
-                    Server::handle_send_record(&mut stream, &unsafe{message.data.send_record}, postgres.clone()).await;
-                }
-                _ => {
-                    println!("Unknown message type: {}", bytes[0]);
-                }
+        let message = unsafe { *(bytes.as_ptr() as *const ClientPacket) };
+
+        match bytes[0] {
+            PACKET_TYPE_GET_INFO => {
+                Server::handle_get_records(
+                    &mut stream,
+                    &unsafe { message.data.get_info },
+                    db.clone(),
+                )
+                .await;
             }
+            PACKET_TYPE_SEND_RECORD => {
+                Server::handle_send_record(
+                    &mut stream,
+                    &unsafe { message.data.send_record },
+                    db.clone(),
+                )
+                .await;
+            }
+            _ => {
+                println!("Unknown message type: {}", bytes[0]);
+            }
+        }
 
-            println!("Ending connection with: {}\n", addr);
-        });
+        println!("Ending connection with: {}\n", addr);
+        // });
     }
 
-    async fn handle_get_records(stream: &mut TcpStream, packet: &PacketGetInfo, postgres: Arc<tokio_postgres::Client>) {
-        let query = r#"
-            SELECT name, wave, time FROM Players
-            ORDER BY wave DESC
-            FETCH FIRST 10 ROWS ONLY
-        "#;
-        let rows = postgres.query(query, &[]).await.expect("Failed to read from database");
-        assert!(rows.len() <= 10);
+    async fn handle_get_records(
+        stream: &mut TcpStream,
+        packet: &PacketGetInfo,
+        db: Arc<Database<'_>>,
+    ) {
+        //
+        // let len = times.len();
+        // let idxs: Vec<usize> = (0..len).collect();
+        // quick_sort(&mut idxs);
 
-        let mut records = [Record {name: [0; 128], wave: 0, time: 0}; 10];
+        let mut records = [Record {
+            name: [0; STRING_BUFFER_SIZE],
+            wave: 0,
+            time: 0,
+        }; 10];
 
-        for (i, row) in rows.iter().enumerate() {
-            let name: String = row.get("name");
-            let wave: u32 = row.get("wave");
-            let time: u32 = row.get("time");
+        for i in 0usize..10 {
+            let record = get_record(db.as_ref(), i as u64);
+            if let None = record {
+                return;
+            }
+            let (name, wave, time) = record.unwrap();
 
             let name = name.as_bytes();
 
@@ -131,47 +155,39 @@ impl Server {
             records[i].time = time;
         }
 
-        let packet: *const u8 = (&ServerPacketData {
-            records,
-        }) as *const ServerPacketData as *const u8;
-        let slice = unsafe {std::slice::from_raw_parts(packet, size_of::<ServerPacketData>())};
+        let packet: *const u8 =
+            (&ServerPacketData { records }) as *const ServerPacketData as *const u8;
+        let slice = unsafe { std::slice::from_raw_parts(packet, size_of::<ServerPacketData>()) };
         stream.write(slice).await.unwrap();
     }
-    async fn handle_send_record(stream: &mut TcpStream, packet: &PacketSendRecord, postgres: Arc<tokio_postgres::Client>) {
-        let query = r#"
-            INSERT INTO Players (name, wave, time)
-            VALUES ($1, $2, $3)
-        "#;
+    async fn handle_send_record(
+        stream: &mut TcpStream,
+        packet: &PacketSendRecord,
+        db: Arc<Database<'_>>,
+    ) {
+        let name = String::from_utf8(packet.string_buffer.to_vec());
 
-        let name = match unsafe{CString::from_raw(packet.string_buffer.clone().as_ptr().cast_mut() as *mut i8)}.to_str() {
-            Ok(value) => value,
-            Err(err) => {
-                println!("{:?}", err);
-                return;
-            }
-        }.to_string();
+        if let Err(err) = name {
+            dbg!(err);
+            return;
+        }
+        let name = name.unwrap();
 
-        postgres.query(query, &[&name, &packet.wave, &packet.time]).await.unwrap();
+        if !name.is_ascii() {
+            return;
+        }
+
+        database::add_record(db.as_ref(), name, packet.wave, packet.time);
     }
 }
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(format!("127.0.0.1:8080")).await?;
-    let mut server = Server {
-        listener
-    };
+    let mut server = Server { listener };
 
-    let (postgres_client, postgres_conn) = tokio_postgres::connect("host=localhost user=postgres", tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(async move {
-        if let Err(e) = postgres_conn.await {
-            eprintln!("connection error: {}", e);
-        }
-    });
-
-    let postgres = Arc::new(postgres_client);
-    server.run(postgres).await;
+    let db = Builder::new().create_in_memory(&MODELS)?;
+    server.run(Arc::new(db)).await;
 
     Ok(())
 }
