@@ -1,36 +1,69 @@
-use serde::{Deserialize, Serialize};
-use native_db::*;
-use native_model::{native_model, Model};
- 
-use once_cell::sync::Lazy;
+use std::{sync::Arc, time::Duration};
 
-#[derive(Serialize, Deserialize, Debug)]
-#[native_model(id = 1, version = 1)]
-#[native_db]
-pub struct DatabaseEntry {
-    #[primary_key]
-    pub id: u64,
-    #[secondary_key]
-    pub record: (String, u32, u32),
+use tokio::{fs, sync::Mutex};
+
+pub struct Record {
+    pub name: String,
+    pub wave: u32,
+    pub time: u32,
 }
 
-pub static MODELS: Lazy<Models> = Lazy::new(|| {
-   let mut models = Models::new();
-   // It's a good practice to define the models by specifying the version
-   models.define::<DatabaseEntry>().unwrap();
-   models
-});
-
-pub fn add_record(db: &Database, name: String, wave: u32, time: u32) {
-    let rw = db.rw_transaction().unwrap();
-    let amount = rw.len().primary::<DatabaseEntry>().unwrap();
-    rw.insert(DatabaseEntry {id: amount, record: (name, wave, time)}).unwrap();
-    rw.commit().unwrap();
+pub struct Database {
+    path: String,
+    records: Vec<Record>,
 }
 
-pub fn get_record(db: &Database, id: u64) -> Option<(String, u32, u32)> {
-    let r = db.r_transaction().unwrap();
-    let record: DatabaseEntry = r.get().primary(id).unwrap()?;
+impl Database {
+    pub async fn new(path: String) -> Arc<Mutex<Database>> {
+        if !fs::try_exists(&path).await.expect("Invalid path") {
+            fs::File::create_new(&path).await.unwrap();
+        }
 
-    Some(record.record)
+        let db = Arc::new(Mutex::new(Database {
+            path,
+            records: Vec::new(),
+        }));
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let db = db_clone.lock().await;
+
+                let mut contents: Vec<u8> = Vec::new();
+                for record in db.records.iter() {
+                    contents.append(&mut record.name.as_bytes().to_vec());
+                    contents.push(0);
+                    contents.append(&mut record.wave.to_string().as_bytes().to_vec());
+                    contents.push(0);
+                    contents.append(&mut record.time.to_string().as_bytes().to_vec());
+                    contents.push(0);
+                }
+
+                fs::write(&db.path, &contents).await.expect("Failed writing to file");
+            }
+        });
+        db
+    }
+}
+
+pub fn add_record(db: &mut Database, name: String, wave: u32, time: u32) {
+    db.records.push(Record {
+        name,
+        wave,
+        time
+    });
+}
+
+pub fn get_records<'a>(db: &'a Database) -> Vec<&'a Record> {
+    let mut vec: Vec<&'a Record> = Vec::new();
+
+    for (i, record) in db.records.iter().enumerate() {
+        if i >= 10 {
+            break;
+        }
+
+        vec.push(record);
+    }
+
+    vec
 }

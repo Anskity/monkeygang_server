@@ -2,12 +2,12 @@ use std::{error::Error, sync::Arc};
 
 use monkeygang_server::{
     STRING_BUFFER_SIZE,
-    database::{self, MODELS, get_record},
+    database::{self, Database, get_records},
 };
-use native_db::{Builder, Database};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::Mutex,
 };
 
 struct Server {
@@ -66,67 +66,67 @@ union ServerPacketData {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ServerPacket {
-    kind: ServerPacketType,
-    data: ServerPacketData,
+    pub kind: ServerPacketType,
+    pub data: ServerPacketData,
 }
 
 impl Server {
-    pub async fn run(&mut self, db: Arc<Database<'_>>) {
+    pub async fn run(&mut self, db: Arc<Mutex<Database>>) {
         let (mut stream, addr) = self
             .listener
             .accept()
             .await
             .expect("Error accepting connection");
 
-        // tokio::spawn(async move {
-        let addr = addr.to_string();
-        println!("Starting connection with: {}", addr);
+        tokio::spawn(async move {
+            let addr = addr.to_string();
+            println!("Starting connection with: {}", addr);
 
-        let mut bytes: [u8; PACKET_SIZE] = [0; PACKET_SIZE];
-        let n: usize = match stream.read(&mut bytes).await {
-            Ok(n) => n,
-            Err(err) => {
-                println!("Got an error: {}", err);
-                return;
+            let mut bytes: [u8; PACKET_SIZE] = [0; PACKET_SIZE];
+            let n: usize = match stream.read(&mut bytes).await {
+                Ok(n) => n,
+                Err(err) => {
+                    println!("Got an error: {}", err);
+                    return;
+                }
+            };
+
+            if n == 0 {
+                println!("Got an empty byte stream");
             }
-        };
 
-        if n == 0 {
-            println!("Got an empty byte stream");
-        }
+            let message = unsafe { *(bytes.as_ptr() as *const ClientPacket) };
 
-        let message = unsafe { *(bytes.as_ptr() as *const ClientPacket) };
-
-        match bytes[0] {
-            PACKET_TYPE_GET_INFO => {
-                Server::handle_get_records(
-                    &mut stream,
-                    &unsafe { message.data.get_info },
-                    db.clone(),
-                )
-                .await;
+            match bytes[0] {
+                PACKET_TYPE_GET_INFO => {
+                    Server::handle_get_records(
+                        &mut stream,
+                        &unsafe { message.data.get_info },
+                        db.clone(),
+                    )
+                    .await;
+                }
+                PACKET_TYPE_SEND_RECORD => {
+                    Server::handle_send_record(
+                        &mut stream,
+                        &unsafe { message.data.send_record },
+                        db.clone(),
+                    )
+                    .await;
+                }
+                _ => {
+                    println!("Unknown message type: {}", bytes[0]);
+                }
             }
-            PACKET_TYPE_SEND_RECORD => {
-                Server::handle_send_record(
-                    &mut stream,
-                    &unsafe { message.data.send_record },
-                    db.clone(),
-                )
-                .await;
-            }
-            _ => {
-                println!("Unknown message type: {}", bytes[0]);
-            }
-        }
 
-        println!("Ending connection with: {}\n", addr);
-        // });
+            println!("Ending connection with: {}\n", addr);
+        });
     }
 
     async fn handle_get_records(
         stream: &mut TcpStream,
-        packet: &PacketGetInfo,
-        db: Arc<Database<'_>>,
+        _: &PacketGetInfo,
+        db: Arc<Mutex<Database>>,
     ) {
         //
         // let len = times.len();
@@ -139,31 +139,29 @@ impl Server {
             time: 0,
         }; 10];
 
-        for i in 0usize..10 {
-            let record = get_record(db.as_ref(), i as u64);
-            if let None = record {
-                return;
-            }
-            let (name, wave, time) = record.unwrap();
+        let mut db_value = db.lock().await;
+        let records_vec = get_records(&mut db_value);
+        for (i, record) in records_vec.iter().enumerate() {
+            let str_bytes = record.name.as_bytes();
 
-            let name = name.as_bytes();
-
-            for chr_idx in 0..(name.len()) {
-                records[i].name[chr_idx] = name[chr_idx];
+            for (j, byte) in str_bytes.iter().enumerate() {
+                records[i].name[j] = *byte;
             }
-            records[i].wave = wave;
-            records[i].time = time;
+            records[i].wave = record.wave;
+            records[i].time = record.time;
         }
 
-        let packet: *const u8 =
-            (&ServerPacketData { records }) as *const ServerPacketData as *const u8;
-        let slice = unsafe { std::slice::from_raw_parts(packet, size_of::<ServerPacketData>()) };
+        let packet = (&ServerPacket {
+            kind: SERVER_PACKET_TYPE_RECORDS,
+            data: ServerPacketData { records },
+        }) as *const ServerPacket as *const u8;
+        let slice = unsafe { std::slice::from_raw_parts(packet, size_of::<ServerPacket>()) };
         stream.write(slice).await.unwrap();
     }
     async fn handle_send_record(
-        stream: &mut TcpStream,
+        _: &mut TcpStream,
         packet: &PacketSendRecord,
-        db: Arc<Database<'_>>,
+        db: Arc<Mutex<Database>>,
     ) {
         let name = String::from_utf8(packet.string_buffer.to_vec());
 
@@ -177,7 +175,8 @@ impl Server {
             return;
         }
 
-        database::add_record(db.as_ref(), name, packet.wave, packet.time);
+        let mut db = db.lock().await;
+        database::add_record(&mut db, name, packet.wave, packet.time);
     }
 }
 
@@ -186,8 +185,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(format!("127.0.0.1:8080")).await?;
     let mut server = Server { listener };
 
-    let db = Builder::new().create_in_memory(&MODELS)?;
-    server.run(Arc::new(db)).await;
+    let db = Database::new("db.txt".to_string()).await;
+    server.run(db).await;
 
     Ok(())
 }
