@@ -14,26 +14,29 @@ struct Server {
     listener: TcpListener,
 }
 
-type ClientPacketType = u8;
-const PACKET_TYPE_GET_INFO: ClientPacketType = 0;
-const PACKET_TYPE_SEND_RECORD: ClientPacketType = 1;
+type ClientPacketType = u32;
+const CLIENT_PACKET_TYPE_GET_INFO: ClientPacketType = 0;
+const CLIENT_PACKET_TYPE_SEND_RECORD: ClientPacketType = 1;
+const CLIENT_PACKET_TYPE_PING: ClientPacketType = 2;
 
 const PACKET_SIZE: usize = size_of::<ClientPacket>();
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct PacketGetInfo {}
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
+#[repr(align(1))]
 struct PacketSendRecord {
-    string_buffer: [u8; STRING_BUFFER_SIZE],
-    wave: u32,
-    time: u32,
+    pub string_buffer: [u8; STRING_BUFFER_SIZE],
+    pub wave: u32,
+    pub time: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[repr(align(1))]
 union ClientPacketData {
     get_info: PacketGetInfo,
     send_record: PacketSendRecord,
@@ -41,15 +44,17 @@ union ClientPacketData {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[repr(align(1))]
 struct ClientPacket {
     kind: ClientPacketType,
     data: ClientPacketData,
 }
 
-type ServerPacketType = u8;
+type ServerPacketType = u32;
 const SERVER_PACKET_TYPE_RECORDS: ServerPacketType = 0;
+const SERVER_PACKET_TYPE_PING: ServerPacketType = 1;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct Record {
     name: [u8; STRING_BUFFER_SIZE],
@@ -61,6 +66,7 @@ struct Record {
 #[derive(Clone, Copy)]
 union ServerPacketData {
     records: [Record; 10],
+    null: (),
 }
 
 #[repr(C)]
@@ -82,40 +88,45 @@ impl Server {
             let addr = addr.to_string();
             println!("Starting connection with: {}", addr);
 
-            let mut bytes: [u8; PACKET_SIZE] = [0; PACKET_SIZE];
-            let n: usize = match stream.read(&mut bytes).await {
-                Ok(n) => n,
-                Err(err) => {
-                    println!("Got an error: {}", err);
-                    return;
-                }
-            };
+            loop {
+                let mut bytes: [u8; PACKET_SIZE] = [0; PACKET_SIZE];
+                let n: usize = match stream.read(&mut bytes).await {
+                    Ok(n) => n,
+                    Err(err) => {
+                        println!("Got an error: {}", err);
+                        break;
+                    }
+                };
 
-            if n == 0 {
-                println!("Got an empty byte stream");
-            }
-
-            let message = unsafe { *(bytes.as_ptr() as *const ClientPacket) };
-
-            match bytes[0] {
-                PACKET_TYPE_GET_INFO => {
-                    Server::handle_get_records(
-                        &mut stream,
-                        &unsafe { message.data.get_info },
-                        db.clone(),
-                    )
-                    .await;
+                if n < size_of::<ClientPacket>() {
+                    break;
                 }
-                PACKET_TYPE_SEND_RECORD => {
-                    Server::handle_send_record(
-                        &mut stream,
-                        &unsafe { message.data.send_record },
-                        db.clone(),
-                    )
-                    .await;
-                }
-                _ => {
-                    println!("Unknown message type: {}", bytes[0]);
+
+                let message = unsafe { *(bytes.as_ptr() as *const ClientPacket) };
+
+                match message.kind {
+                    CLIENT_PACKET_TYPE_GET_INFO => {
+                        Server::handle_get_records(
+                            &mut stream,
+                            &unsafe { message.data.get_info },
+                            db.clone(),
+                        )
+                        .await;
+                    }
+                    CLIENT_PACKET_TYPE_SEND_RECORD => {
+                        Server::handle_send_record(
+                            &mut stream,
+                            &unsafe { message.data.send_record },
+                            db.clone(),
+                        )
+                        .await;
+                    }
+                    CLIENT_PACKET_TYPE_PING => {
+                        Server::send_ping(&mut stream).await;
+                    }
+                    _ => {
+                        println!("Unknown message type: {}", bytes[0]);
+                    }
                 }
             }
 
@@ -151,15 +162,16 @@ impl Server {
             records[i].time = record.time;
         }
 
-        let packet = (&ServerPacket {
+        let packet = ServerPacket {
             kind: SERVER_PACKET_TYPE_RECORDS,
             data: ServerPacketData { records },
-        }) as *const ServerPacket as *const u8;
-        let slice = unsafe { std::slice::from_raw_parts(packet, size_of::<ServerPacket>()) };
+        };
+        let packet_ptr = (&packet) as *const ServerPacket as *const u8;
+        let slice = unsafe { std::slice::from_raw_parts(packet_ptr, size_of::<ServerPacket>()) };
         stream.write(slice).await.unwrap();
     }
     async fn handle_send_record(
-        _: &mut TcpStream,
+        _stream: &mut TcpStream,
         packet: &PacketSendRecord,
         db: Arc<Mutex<Database>>,
     ) {
@@ -178,6 +190,17 @@ impl Server {
         let mut db = db.lock().await;
         database::add_record(&mut db, name, packet.wave, packet.time);
     }
+    async fn send_ping(
+        stream: &mut TcpStream,
+    ) {
+        let packet = ServerPacket {
+            kind: SERVER_PACKET_TYPE_PING,
+            data: ServerPacketData { null: () },
+        };
+        let packet_ptr = (&packet) as *const ServerPacket as *const u8;
+        let slice = unsafe { std::slice::from_raw_parts(packet_ptr, size_of::<ServerPacket>()) };
+        stream.write(slice).await.unwrap();
+    }
 }
 
 #[tokio::main]
@@ -186,7 +209,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut server = Server { listener };
 
     let db = Database::new("db.txt".to_string()).await;
-    server.run(db).await;
 
-    Ok(())
+    loop {
+        server.run(db.clone()).await;
+    }
 }
